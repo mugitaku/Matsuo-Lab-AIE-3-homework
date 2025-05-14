@@ -27,15 +27,109 @@ LLMを活用して情報のファクトチェック機能の開発は活発に�
 
 
 # 2. RAGの実装方法と工夫点
+## 2.1. RAGなし
+まずはベースモデルがどの程度知識を持っているか確かめる。
+
+```
+messages = [
+    {"role": "user", "content": "X氏「私は雨の日が嫌いだ。」Y氏「もし雨が降らなかったら干ばつで農作物は枯れ、ダムは枯渇し我々はみな餓死することになるが、それでもX氏は雨など無くなったほうが良いと言うのであろうか。」Y氏の主張は次のうちどれに該当するか。「A.衆人に訴える論証」「B.権威に訴える論証」「C.ストローマン」「D.いずれにも該当しない」"},
+]
+input_ids = tokenizer.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    return_tensors="pt"
+).to(model.device)
+
+terminators = [
+    tokenizer.eos_token_id,
+    tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
+
+outputs = model.generate(
+    input_ids,
+    max_new_tokens=256,
+    eos_token_id=terminators,
+    do_sample=False,
+    # temperature=0.6, # If do_sample=True
+    # top_p=0.9,  # If do_sample=True
+)
+
+response = outputs[0][input_ids.shape[-1]:]
+print(tokenizer.decode(response, skip_special_tokens=True))
+```
+
+## 2.2. RAGあり
 RAGは、第3回講義資料の「2. 文字起こしデータの活用」に記載された実装方法をほぼそのまま利用している。
 
-[RAGに与えるデータ](https://github.com/mugitaku/Matsuo-Lab-AIE-3-homework/blob/main/Argumentum-ad-populum.txt)は、WIkipediaの記事から取得し、行ごとにチャンク化した。
+```
+from sentence_transformers import SentenceTransformer
+
+emb_model = SentenceTransformer("infly/inf-retriever-v1-1.5b", trust_remote_code=True)
+# In case you want to reduce the maximum length:
+emb_model.max_seq_length = 4096
+```
+
+[RAGに与えるデータ](https://github.com/mugitaku/Matsuo-Lab-AIE-3-homework/blob/main/Argumentum-ad-populum.txt)は、WIkipediaの記事から取得し、行単位でチャンク化した。
 *   [衆人に訴える論証
 ](https://ja.wikipedia.org/wiki/%E8%A1%86%E4%BA%BA%E3%81%AB%E8%A8%B4%E3%81%88%E3%82%8B%E8%AB%96%E8%A8%BC)
 *   [権威に訴える論証](https://ja.wikipedia.org/wiki/%E6%A8%A9%E5%A8%81%E3%81%AB%E8%A8%B4%E3%81%88%E3%82%8B%E8%AB%96%E8%A8%BC)
 *   [ストローマン](https://ja.wikipedia.org/wiki/%E3%82%B9%E3%83%88%E3%83%AD%E3%83%BC%E3%83%9E%E3%83%B3)
 
 LLMへの質問文は記事の例文から取得しているので、例文が挙げられているセクションはRAGへ読ませるテキストから除外した。
+
+```
+!rm -rf Matsuo-Lab-AIE-3-homework
+!git clone https://github.com/mugitaku/Matsuo-Lab-AIE-3-homework
+with open("/content/Matsuo-Lab-AIE-3-homework/Argumentum-ad-populum.txt", "r") as f:
+  raw_writedown = f.read()
+documents = [text.strip() for text in raw_writedown.split("\n")] #行単位でチャンク化
+
+# Retrievalの実行
+question = "X氏「私は雨の日が嫌いだ。」Y氏「もし雨が降らなかったら干ばつで農作物は枯れ、ダムは枯渇し我々はみな餓死することになるが、それでもX氏は雨など無くなったほうが良いと言うのであろうか。」Y氏の主張は次のうちどれに該当するか。「A.衆人に訴える論証」「B.権威に訴える論証」「C.ストローマン」「D.いずれにも該当しない」"
+
+query_embeddings = emb_model.encode([question], prompt_name="query")
+document_embeddings = emb_model.encode(documents)
+
+# 各ドキュメントの類似度スコア
+scores = (query_embeddings @ document_embeddings.T) * 100
+print(scores.tolist())
+```
+
+```
+topk = 5
+for i, index in enumerate(scores.argsort()[0][::-1][:topk]):
+  print(f"取得したドキュメント{i+1}: (Score: {scores[0][index]})")
+  print(documents[index], "\n\n")
+```
+
+```
+references = "\n".join(["* " + documents[i] for i in scores.argsort()[0][::-1][:topk]])
+messages = [
+    {"role": "user", "content": f"[参考資料]\n{references}\n\n[質問]X氏「私は雨の日が嫌いだ。」Y氏「もし雨が降らなかったら干ばつで農作物は枯れ、ダムは枯渇し我々はみな餓死することになるが、それでもX氏は雨など無くなったほうが良いと言うのであろうか。」Y氏の主張は次のうちどれに該当するか。「A.衆人に訴える論証」「B.権威に訴える論証」「C.ストローマン」「D.いずれにも該当しない」"},
+]
+input_ids = tokenizer.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    return_tensors="pt"
+).to(model.device)
+
+terminators = [
+    tokenizer.eos_token_id,
+    tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
+
+outputs = model.generate(
+    input_ids,
+    max_new_tokens=256,
+    eos_token_id=terminators,
+    do_sample=False,
+)
+```
+
+```
+response = outputs[0][input_ids.shape[-1]:]
+print(tokenizer.decode(response, skip_special_tokens=True))
+```
 
 # 3.結果の分析と考察
 | 質問項目 | RAGなし | RAGあり |RAG導入による効果|
